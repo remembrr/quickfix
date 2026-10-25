@@ -76,16 +76,28 @@ bool Parser::readFixMessage(std::string &str) EXCEPT(MessageParseError) {
 
   try {
     if (extractLength(length, pos, m_buffer)) {
+      std::string::size_type bodyStart = pos;
       pos += length;
-      if (m_buffer.size() < pos) {
+
+      // Need the SOH that terminates the final body field (at pos - 1) plus the
+      // three bytes of the "10=" CheckSum tag before we can decide the frame.
+      if (pos < 1 || pos + 3 > m_buffer.size()) {
         return false;
       }
 
-      pos = m_buffer.find("\00110=", pos - 1);
-      if (pos == std::string::npos) {
-        return false;
+      // GHSA-8f9j-mq72-p663 (CWE-444): the CheckSum field MUST begin exactly at
+      // the BodyLength-derived boundary. The previous implementation searched
+      // forward for "\00110=", which accepted a CheckSum tag appearing *after*
+      // the boundary and let framing, validation and application-level reads
+      // operate over different byte ranges of the same input (message smuggling
+      // / parser desynchronization). Require an exact boundary match and treat
+      // any deviation as a hard frame error.
+      if (m_buffer[pos - 1] != '\001' || m_buffer.compare(pos, 3, "10=") != 0) {
+        pos = bodyStart; // catch below discards exactly [0, bodyStart + length)
+        throw MessageParseError();
       }
-      pos += 4;
+
+      pos += 3; // advance past "10="
       pos = m_buffer.find("\001", pos);
       if (pos == std::string::npos) {
         return false;

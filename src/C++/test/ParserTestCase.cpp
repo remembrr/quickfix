@@ -127,4 +127,27 @@ TEST_CASE("ParserTests") {
     CHECK_THROWS_AS(object.readFixMessage(readFixMsg), MessageParseError);
     object.readFixMessage(readFixMsg);
   }
+
+  SECTION("rejectsChecksumNotAtBodyLengthBoundary") {
+    // GHSA-8f9j-mq72-p663 (CWE-444): a field is injected between the
+    // BodyLength-derived boundary and the real "10=". A correct parser must
+    // reject the frame instead of searching forward and swallowing the
+    // smuggled bytes as part of the message.
+    std::string smuggled = "8=FIX.4.2\0019=12\00135=A\001108=30\0019999=INJECTED\00110=111\001";
+    object.addToStream(smuggled);
+    std::string out;
+    CHECK_THROWS_AS(object.readFixMessage(out), MessageParseError);
+
+    // Well-formed frames whose CheckSum sits exactly on the boundary are still
+    // accepted -- including when a body field value itself contains "10=".
+    Parser clean;
+    std::string ok1 = "8=FIX.4.2\0019=12\00135=A\001108=30\00110=111\001";
+    std::string ok2 = "8=FIX.4.2\0019=19\00135=A\001108=30\0019710=8\00110=111\001";
+    clean.addToStream(ok1 + ok2);
+    std::string read;
+    CHECK(clean.readFixMessage(read));
+    CHECK(ok1 == read);
+    CHECK(clean.readFixMessage(read));
+    CHECK(ok2 == read);
+  }
 }

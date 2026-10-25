@@ -282,7 +282,26 @@ protected:
   void appendField(const FieldBase &field) { m_fields.push_back(field); }
 
   // sort fields after message decoding
-  void sortFields() { std::sort(m_fields.begin(), m_fields.end(), sorter(m_order)); }
+  // GHSA-8f9j-mq72-p663 (CWE-444): use a STABLE sort so that fields sharing a
+  // tag keep their decode order. lookup() uses linear search below 16 fields
+  // and binary search (lower_bound) at or above it; with an unstable sort those
+  // two paths could resolve a duplicate tag to different values, letting
+  // validation and application reads diverge. Stable ordering keeps both paths
+  // consistent with first-on-the-wire semantics.
+  void sortFields() { std::stable_sort(m_fields.begin(), m_fields.end(), sorter(m_order)); }
+
+  /// Returns true (and sets duplicateTag) if two fields at this level share a
+  /// tag. Assumes sortFields() has run, so equal tags are adjacent. Groups are
+  /// held in m_groups and are intentionally not considered here.
+  bool hasDuplicateTags(int &duplicateTag) const {
+    for (Fields::size_type i = 1; i < m_fields.size(); ++i) {
+      if (m_fields[i].getTag() == m_fields[i - 1].getTag()) {
+        duplicateTag = m_fields[i].getTag();
+        return true;
+      }
+    }
+    return false;
+  }
 
 private:
   Fields::const_iterator findTag(int tag) const { return lookup(m_fields.begin(), m_fields.end(), tag); }

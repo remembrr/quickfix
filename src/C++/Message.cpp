@@ -293,6 +293,67 @@ std::string Message::toXMLFields(const FieldMap &fields, int space) const {
   return stream.str();
 }
 
+namespace {
+// GHSA-8f9j-mq72-p663 (CWE-444): validate BodyLength and CheckSum against the
+// ORIGINAL raw framed bytes, independent of the canonicalized field map. This
+// anchors validation to exactly the bytes received, so field reordering,
+// duplication or boundary tricks that survive canonicalization are rejected.
+void validateRawFraming(const std::string &string) {
+  if (string.empty() || string[string.size() - 1] != '\001') {
+    throw InvalidMessage("CheckSum is missing");
+  }
+  // CheckSum is the final "10=NNN<SOH>" field of the frame.
+  std::string::size_type csStart = string.rfind("\00110=");
+  if (csStart == std::string::npos) {
+    throw InvalidMessage("CheckSum is missing");
+  }
+  csStart += 1; // index of '1' in "10="
+
+  unsigned int rawSum = 0;
+  for (std::string::size_type i = 0; i < csStart; ++i) {
+    rawSum += static_cast<unsigned char>(string[i]);
+  }
+  rawSum %= 256;
+
+  int declaredChecksum = 0;
+  try {
+    declaredChecksum = IntConvertor::convert(string.substr(csStart + 3, (string.size() - 1) - (csStart + 3)));
+  } catch (FieldConvertError &) {
+    throw InvalidMessage("CheckSum has wrong format");
+  }
+  if (static_cast<int>(rawSum) != declaredChecksum) {
+    std::stringstream text;
+    text << "Expected CheckSum=" << rawSum << ", Received CheckSum=" << declaredChecksum;
+    throw InvalidMessage(text.str());
+  }
+
+  // BodyLength is the raw byte distance from the first body byte (after
+  // "9=NNN<SOH>") up to and including the SOH that precedes "10=".
+  std::string::size_type blTag = string.find("\0019=");
+  if (blTag == std::string::npos) {
+    throw InvalidMessage("BodyLength is missing");
+  }
+  std::string::size_type blValue = blTag + 3;
+  std::string::size_type bodyStart = string.find('\001', blValue);
+  if (bodyStart == std::string::npos || csStart < bodyStart + 1) {
+    throw InvalidMessage("BodyLength is missing");
+  }
+  int declaredBodyLength = 0;
+  try {
+    declaredBodyLength = IntConvertor::convert(string.substr(blValue, bodyStart - blValue));
+  } catch (FieldConvertError &) {
+    throw InvalidMessage("BodyLength has wrong format");
+  }
+  bodyStart += 1;
+  const std::string::size_type rawBodyLength = csStart - bodyStart;
+  if (static_cast<int>(rawBodyLength) != declaredBodyLength) {
+    std::stringstream text;
+    text << "Expected BodyLength=" << rawBodyLength << ", Received BodyLength=" << declaredBodyLength;
+    throw InvalidMessage(text.str());
+  }
+}
+} // namespace
+
 void Message::setString(
     const std::string &string,
     bool doValidation,
@@ -365,6 +426,29 @@ void Message::setString(
   m_trailer.sortFields();
 
   if (doValidation) {
+    // Anchor validation to the original wire bytes before trusting the
+    // canonicalized field map (GHSA-8f9j-mq72-p663, CWE-444).
+    validateRawFraming(string);
+
+    // A message whose sections are out of order was previously parsed with
+    // m_validStructure=false but still accepted; treat it as a hard failure
+    // when validation is requested (CWE-20).
+    if (!m_validStructure) {
+      throw InvalidMessage(std::string("Invalid message structure near tag ") + IntConvertor::convert(m_tag));
+    }
+
+    // Reject duplicate non-group tags (CWE-20). With a session dictionary
+    // present, repeating groups have already been consumed into sub-maps, so a
+    // remaining repeated tag at any level is a genuine duplicate that would let
+    // validation and application-level reads observe different values.
+    if (pSessionDataDictionary) {
+      int duplicateTag = 0;
+      if (m_header.hasDuplicateTags(duplicateTag) || hasDuplicateTags(duplicateTag)
+          || m_trailer.hasDuplicateTags(duplicateTag)) {
+        throw InvalidMessage(std::string("Duplicate tag ") + IntConvertor::convert(duplicateTag));
+      }
+    }
+
     validate();
   }
 }
@@ -606,7 +690,24 @@ FIX::FieldBase Message::extractField(
 
     try {
       const FieldBase &fieldLength = location->reverse_find(lenField);
-      soh = valueStart + IntConvertor::convert(fieldLength.getString());
+      // GHSA-8f9j-mq72-p663 (CWE-20): the declared length steers how many raw
+      // bytes of the value are consumed. A negative or oversized length (for
+      // example from a duplicated or forged length tag) previously advanced the
+      // iterator past the end of the buffer, causing out-of-bounds reads.
+      // Bound it strictly and require the SOH to fall exactly where the declared
+      // length ends.
+      const int dataLength = IntConvertor::convert(fieldLength.getString());
+      if (dataLength < 0 || dataLength > std::distance(valueStart, strEnd)) {
+        throw InvalidMessage(
+            std::string("Invalid data length ") + IntConvertor::convert(dataLength)
+            + std::string(" for data field ") + IntConvertor::convert(field));
+      }
+      soh = valueStart + dataLength;
+      if (soh == strEnd || *soh != '\001') {
+        throw InvalidMessage(
+            std::string("Data field ") + IntConvertor::convert(field)
+            + std::string(" is not terminated by SOH at its declared length"));
+      }
     } catch (FieldNotFound &) {
       throw InvalidMessage(
           std::string("Data length field ") + IntConvertor::convert(lenField)
